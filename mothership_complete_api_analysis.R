@@ -1,6 +1,3 @@
-# Mothership Complete API Analysis - Incorporating proven successful methods
-# This uses the exact logic from the successful mothership_self_dealing.R script
-
 library(ggplot2)
 library(dplyr)
 library(scales)
