@@ -315,6 +315,7 @@ if(nrow(comms.all) > 0){
     write.csv(top_clients,file='mothership_top_clients.csv', row.names=FALSE)
 
     # Use committee IDs from the analysis for the next steps
+    top_100_clients <- top_clients  # alias needed because object referenced below
     cmte_ids <- unique(na.omit(top_100_clients$CMTE_ID))
 } else {
     cmte_ids <- unique(na.omit(mothership_payments$committee_id))
