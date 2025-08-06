@@ -8,6 +8,13 @@ library(lubridate)
 library(stringr)
 library(tidyr)
 
+# ----------------------------------------------------------------------------
+# Helper to flatten list-columns before writing CSVs
+# ----------------------------------------------------------------------------
+flatten_lists <- function(df) {
+  df %>% mutate(across(where(is.list), ~ sapply(., function(x) paste(unlist(x), collapse = ", "))))
+}
+
 
 
 
@@ -85,7 +92,8 @@ fetch_all_pages <- function(path, query_params, set_limit=10) {
         break
     }
 
-    cat(".") # Print a dot for progress
+    cat(".")
+flush.console() # Print a dot for progress
   }
   cat("\n")
 
@@ -96,8 +104,9 @@ fetch_all_pages <- function(path, query_params, set_limit=10) {
 
 # --- Get Committee Leadership and Treasurer Info ---
 get_committee_details <- function(committee_id) {
-  Sys.sleep(0.5) # Be polite to the API by pausing between requests
+  Sys.sleep(1.0) # Be polite to the API by pausing between requests
   cat("Fetching details for:", committee_id, "\n")
+flush.console()
 
   path <- file.path("committee", committee_id)
   # The fetch_fec_data function returns the full content object,
@@ -126,8 +135,9 @@ get_committee_details <- function(committee_id) {
 
 # --- Get Incoming Transfers from Other Committees ---
 get_incoming_transfers <- function(committee_id) {
-  Sys.sleep(0.5)
+  Sys.sleep(1.0)
   cat("Fetching incoming transfers for:", committee_id, "\n")
+flush.console()
 
   path = str_glue("schedules/schedule_a/")
   query <- list(
@@ -145,8 +155,9 @@ get_incoming_transfers <- function(committee_id) {
 
 # --- Get Outgoing Transfers to Other Committees ---
 get_outgoing_transfers <- function(committee_id) {
-    Sys.sleep(0.5)
+    Sys.sleep(1.0)
     cat("Fetching ALL outgoing transfers for:", committee_id, "\n")
+flush.console()
     path <- "schedules/schedule_b/"
     query <- list(
         committee_id = committee_id,
@@ -186,8 +197,9 @@ get_outgoing_transfers <- function(committee_id) {
 
 # --- Get Contributions Made by a Committee ---
 get_spending <- function(committee_id) {
-  Sys.sleep(0.5)
+  Sys.sleep(1.0)
   cat("Fetching ALL contributions for:", committee_id, "\n")
+flush.console()
   path <- "schedules/schedule_a/"
   query <- list(
       contributor_id = committee_id,
@@ -196,6 +208,21 @@ get_spending <- function(committee_id) {
       per_page=100
   )
   data <- fetch_all_pages(path, query, set_limit=20)
+  return(data)
+}
+
+# --- Get Independent Expenditures by a Committee ---
+get_independent_expenditures <- function(committee_id) {
+  Sys.sleep(1.0)
+  cat("Fetching independent expenditures for:", committee_id, "\n")
+flush.console()
+  path <- "schedules/schedule_e/"
+  query <- list(
+      committee_id = committee_id,
+      sort = "-expenditure_amount",
+      per_page = 100
+  )
+  data <- fetch_all_pages(path, query, set_limit = 20)
   return(data)
 }
 
@@ -403,17 +430,30 @@ colnames(mothership_clients) <- c('CMTE_ID','Committee Name')
 
 cmte_ids <- unique(c(mothership_connected_pacs$CMTE_ID, mothership_clients$CMTE_ID))
 
-# Use purrr::map_dfr to apply the function to each ID and row-bind the results
-committee_details_df <- map_dfr(cmte_ids, get_committee_details)
+# Use purrr::map_dfr to apply the function to each ID and row-bind the results with error handling
+cat("Will attempt API collection for", length(cmte_ids), "committees\n")
+committee_details_list <- map(cmte_ids, function(cmte_id) {
+  tryCatch({
+    get_committee_details(cmte_id)
+  }, error = function(e) {
+    cat("Warning: Failed to fetch committee details for", cmte_id, ":", e$message, "\n")
+    return(data.frame())
+  })
+})
+committee_details_df <- bind_rows(committee_details_list)
+cat("Successfully collected details for", nrow(committee_details_df), "committees\n")
 write.csv(committee_details_df,file='mothership_connected_committee_details.csv')
 
 
 cat("\n=== COLLECTING INCOMING TRANSFERS ===\n")
+cat("Processing", length(cmte_ids), "committees...\n")
+flush.console()
 # Try to execute - with error handling for rate limits
 tryCatch({
   incoming_transfers_df <- map_dfr(cmte_ids, get_incoming_transfers)
   cat("Total incoming transfer records collected:", nrow(incoming_transfers_df), "\n")
-  write_csv(incoming_transfers_df,file='ms_incoming_transfers.csv')  
+  incoming_transfers_df_clean <- flatten_lists(incoming_transfers_df)
+  write.csv(incoming_transfers_df_clean,file='ms_incoming_transfers.csv', row.names=FALSE)  
   }, error = function(e) {
   cat("API collection for incoming transfers failed:", e$message, "\n")
   incoming_transfers_df <- data.frame()
@@ -421,6 +461,8 @@ tryCatch({
 
 
 cat("\n=== COLLECTING OUTGOING TRANSFERS ===\n")
+cat("Processing", length(cmte_ids), "committees...\n")
+flush.console()
 # Try to execute outgoing transfers collection
 tryCatch({
   outgoing_transfers_df <- map_dfr(cmte_ids, get_outgoing_transfers)
@@ -431,6 +473,67 @@ tryCatch({
   outgoing_transfers_df <- data.frame()
 })
 
+cat("\n=== COLLECTING INDEPENDENT EXPENDITURES ===\n")
+cat("Processing", length(cmte_ids), "committees...\n")
+flush.console()
+tryCatch({
+  # Collect independent expenditures with individual committee error handling
+  independent_exp_list <- map(cmte_ids, function(cmte_id) {
+    tryCatch({
+      get_independent_expenditures(cmte_id)
+    }, error = function(e) {
+      cat("Warning: Failed to fetch independent expenditures for committee", cmte_id, ":", e$message, "\n")
+      return(data.frame())
+    })
+  })
+  independent_exp_df <- bind_rows(independent_exp_list)
+  cat("Total independent expenditure records collected (raw):", nrow(independent_exp_df), "\n")
+  # Dump raw IE data for offline debugging (flatten list-columns first)
+  write.csv(flatten_lists(independent_exp_df), file='raw_independent_exp.csv', row.names=FALSE)
+  # ----------------------------------------------------------------------------
+  # Filter to core network and 2018+ cycles, de-duplicate on sub_id
+  # ----------------------------------------------------------------------------
+  core_ids_vec <- mothership_connected_pacs$CMTE_ID
+  # Flatten two_year_transaction_period if it's a list-column
+  if ("two_year_transaction_period" %in% names(independent_exp_df) &&
+      is.list(independent_exp_df$two_year_transaction_period)) {
+    independent_exp_df <- independent_exp_df %>%
+        mutate(two_year_transaction_period = sapply(two_year_transaction_period, function(x) if(length(x)>0) x[[1]] else NA))
+  }
+  # --- Robust cycle calculation replacing previous mutate block ---
+  independent_exp_df <- independent_exp_df %>%
+      mutate(exp_year = ifelse(!is.na(expenditure_date) & nchar(as.character(expenditure_date)) >= 4,
+                               as.integer(substr(as.character(expenditure_date),1,4)), NA))
+
+  # Convert two_year_transaction_period to numeric scalar
+  if ("two_year_transaction_period" %in% names(independent_exp_df)) {
+      if (is.list(independent_exp_df$two_year_transaction_period)) {
+          independent_exp_df <- independent_exp_df %>% mutate(
+              two_year_tp_num = sapply(two_year_transaction_period, function(x) if(length(x) > 0) as.integer(x[[1]]) else NA_integer_)
+          )
+      } else {
+          independent_exp_df <- independent_exp_df %>% mutate(two_year_tp_num = as.integer(two_year_transaction_period))
+      }
+  } else {
+      independent_exp_df$two_year_tp_num <- NA_integer_
+  }
+
+  independent_exp_df <- independent_exp_df %>%
+      mutate(cycle_calculated = ifelse(!is.na(two_year_tp_num),
+                                       two_year_tp_num,
+                                       ifelse(!is.na(exp_year),
+                                              ifelse(exp_year %% 2 == 0, exp_year, exp_year + 1),
+                                              NA_integer_))) %>%
+      filter(committee_id %in% core_ids_vec,
+             !is.na(cycle_calculated) & cycle_calculated >= 2018) %>%
+      distinct(sub_id, .keep_all = TRUE)
+  cat("Independent expenditure records after filters:", nrow(independent_exp_df), "\n")
+  independent_exp_df_clean <- flatten_lists(independent_exp_df)
+  write.csv(independent_exp_df_clean, file='independent_expenditures_by_ms_connected_pacs.csv', row.names=FALSE)  # Final IE output
+}, error = function(e) {
+  cat("API collection for independent expenditures failed:", e$message, "\n")
+  independent_exp_df <- data.frame()
+})
 
 cat("\n=== COLLECTING CONTRIBUTIONS MADE BY MOTHERSHIP PACS ===\n")
 tryCatch({
@@ -438,7 +541,7 @@ tryCatch({
   cat("Total contributions recorded:", nrow(contributions_made), "\n")
   if(nrow(contributions_made) > 0) {
       library(readr)
-      write_csv(contributions_made, file='fec_contributions_made_by_mothership_pacs.csv')
+      write.csv(flatten_lists(contributions_made), file='fec_contributions_made_by_mothership_pacs.csv', row.names=FALSE)
       cat("Total amount of contributions made: $", sum(contributions_made$contribution_receipt_amount), "\n")
   }
 }, error = function(e) {
@@ -517,11 +620,14 @@ if (exists("self_dealing_df") && nrow(self_dealing_df) > 0) {
 
 
 ##Since 2018, this core network of Mothership-linked PACs has raised approximately $678 million 
-top.clients <- read.csv('mothership_top_clients.csv')
-
-cat("Total Fees paid to Mothership:", sum(top_clients$mothership_total[!duplicated(top_clients$committee_id)]))
-
-ms.connected <- top.clients %>% filter(committee_id %in%  mothership_connected_pacs$CMTE_ID)
+if (file.exists('mothership_top_clients.csv')) {
+  top.clients <- read.csv('mothership_top_clients.csv')
+  cat("Total Fees paid to Mothership:", sum(top.clients$mothership_total[!duplicated(top.clients$committee_id)]), "\n")
+  ms.connected <- top.clients %>% filter(committee_id %in%  mothership_connected_pacs$CMTE_ID)
+} else {
+  cat("Top-client summary skipped – mothership_top_clients.csv not present.\n")
+  ms.connected <- data.frame()
+}
 # ms.connected <- ms.connected[!duplicated(ms.connected$cyc_id),]
 cat("Mothership Connected PACs Total Indv Fundraising:", dollar(sum(ms.connected$indv_contrib, na.rm = TRUE)), "\n")
 
@@ -529,8 +635,9 @@ cat("Mothership Connected PACs Total Indv Fundraising:", dollar(sum(ms.connected
 ms.connected2 <- ms.connected[!duplicated(ms.connected$committee_id),]
 cat("Mothership Connected PACs Payments to Mothership:", dollar(sum(ms.connected2$mothership_total, na.rm = TRUE)), "\n")
 
-ms.disb <- read.csv('disbursements_by_ms_connected_pacs.csv')
-ms.disb <- ms.disb %>% filter(donor_committee_id %in% mothership_connected_pacs$CMTE_ID)
+ms.disb <- read.csv('disbursements_by_ms_connected_pacs.csv') %>%
+            filter(donor_committee_id %in% mothership_connected_pacs$CMTE_ID,
+                   cycle >= 2018)
 
 ##fundraising
 adfund.keywords <-paste("donor","banquet",'messaging','digital','consult','text','email',
@@ -574,7 +681,16 @@ trans_in_network <- ttt %>% filter(recipient_committee_id %in% unq_cmte_ids)
 trans_out_network <- ttt %>% filter(!(recipient_committee_id %in% unq_cmte_ids))
 
 total.spent.on.cands.and.comms <- sum(out_network_contribs$transfer_amount) + sum(trans_out_network$transfer_amount)
-cat("Total spent on outside candidates and committees: ", dollar(total.spent.on.cands.and.comms), "\n")
+
+# Add independent expenditures to total if available
+if (exists("independent_exp_df") && nrow(independent_exp_df) > 0) {
+  candidate_ies <- independent_exp_df %>% filter(!is.na(candidate_id))
+  total_candidate_ie <- sum(candidate_ies$expenditure_amount, na.rm = TRUE)
+  total.spent.on.cands.and.comms <- total.spent.on.cands.and.comms + total_candidate_ie
+  cat("Total independent expenditures (candidate related): ", dollar(total_candidate_ie), "\n")
+}
+
+cat("Total spent on outside candidates and committees (including IEs): ", dollar(total.spent.on.cands.and.comms), "\n")
 
 # Correcting committee names for Sankey diagram
 self_deal <- read.csv("mothership_self_dealing_api_complete.csv")
